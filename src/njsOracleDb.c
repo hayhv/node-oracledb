@@ -1,4 +1,4 @@
-// Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
+// Copyright (c) 2015, 2020, Oracle and/or its affiliates. All rights reserved.
 
 //-----------------------------------------------------------------------------
 //
@@ -58,6 +58,7 @@ static NJS_NAPI_GETTER(njsOracleDb_getOracleClientVersionString);
 static NJS_NAPI_GETTER(njsOracleDb_getOutFormat);
 static NJS_NAPI_GETTER(njsOracleDb_getPoolIncrement);
 static NJS_NAPI_GETTER(njsOracleDb_getPoolMax);
+static NJS_NAPI_GETTER(njsOracleDb_getPoolMaxPerShard);
 static NJS_NAPI_GETTER(njsOracleDb_getPoolMin);
 static NJS_NAPI_GETTER(njsOracleDb_getPoolPingInterval);
 static NJS_NAPI_GETTER(njsOracleDb_getPoolTimeout);
@@ -81,6 +82,7 @@ static NJS_NAPI_SETTER(njsOracleDb_setMaxRows);
 static NJS_NAPI_SETTER(njsOracleDb_setOutFormat);
 static NJS_NAPI_SETTER(njsOracleDb_setPoolIncrement);
 static NJS_NAPI_SETTER(njsOracleDb_setPoolMax);
+static NJS_NAPI_SETTER(njsOracleDb_setPoolMaxPerShard);
 static NJS_NAPI_SETTER(njsOracleDb_setPoolMin);
 static NJS_NAPI_SETTER(njsOracleDb_setPoolPingInterval);
 static NJS_NAPI_SETTER(njsOracleDb_setPoolTimeout);
@@ -151,6 +153,20 @@ static njsConstant njsClassConstants[] = {
     { "STMT_TYPE_ROLLBACK", DPI_STMT_TYPE_ROLLBACK },
     { "STMT_TYPE_COMMIT", DPI_STMT_TYPE_COMMIT },
 
+    // shutdown modes
+    { "SHUTDOWN_MODE_DEFAULT", DPI_MODE_SHUTDOWN_DEFAULT },
+    { "SHUTDOWN_MODE_TRANSACTIONAL", DPI_MODE_SHUTDOWN_TRANSACTIONAL },
+    { "SHUTDOWN_MODE_TRANSACTIONAL_LOCAL",
+            DPI_MODE_SHUTDOWN_TRANSACTIONAL_LOCAL },
+    { "SHUTDOWN_MODE_IMMEDIATE", DPI_MODE_SHUTDOWN_IMMEDIATE },
+    { "SHUTDOWN_MODE_ABORT", DPI_MODE_SHUTDOWN_ABORT },
+    { "SHUTDOWN_MODE_FINAL", DPI_MODE_SHUTDOWN_FINAL },
+
+    // startup modes
+    { "STARTUP_MODE_DEFAULT", DPI_MODE_STARTUP_DEFAULT },
+    { "STARTUP_MODE_FORCE", DPI_MODE_STARTUP_FORCE },
+    { "STARTUP_MODE_RESTRICT", DPI_MODE_STARTUP_RESTRICT },
+
     // subscription event types
     { "SUBSCR_EVENT_TYPE_SHUTDOWN", DPI_EVENT_SHUTDOWN },
     { "SUBSCR_EVENT_TYPE_SHUTDOWN_ANY", DPI_EVENT_SHUTDOWN_ANY },
@@ -185,6 +201,7 @@ static njsConstant njsClassConstants[] = {
     { "CURSOR", NJS_DATATYPE_CURSOR },
     { "DATE", NJS_DATATYPE_DATE },
     { "DEFAULT", NJS_DATATYPE_DEFAULT },
+    { "NCLOB", NJS_DATATYPE_NCLOB },
     { "NUMBER", NJS_DATATYPE_NUM },
     { "STRING", NJS_DATATYPE_STR },
 
@@ -195,6 +212,7 @@ static njsConstant njsClassConstants[] = {
     { "SYSDG", DPI_MODE_AUTH_SYSDGD },
     { "SYSKM", DPI_MODE_AUTH_SYSKMT },
     { "SYSOPER", DPI_MODE_AUTH_SYSOPER },
+    { "SYSPRELIM", DPI_MODE_AUTH_PRELIM },
     { "SYSRAC", DPI_MODE_AUTH_SYSRAC },
 
     // bind directions
@@ -286,6 +304,8 @@ static const napi_property_descriptor njsClassProperties[] = {
             njsOracleDb_setPoolIncrement, NULL, napi_default, NULL },
     { "poolMax", NULL, NULL, njsOracleDb_getPoolMax, njsOracleDb_setPoolMax,
             NULL, napi_default, NULL },
+    { "poolMaxPerShard", NULL, NULL, njsOracleDb_getPoolMaxPerShard,
+            njsOracleDb_setPoolMaxPerShard, NULL, napi_default, NULL },
     { "poolMin", NULL, NULL, njsOracleDb_getPoolMin, njsOracleDb_setPoolMin,
             NULL, napi_default, NULL },
     { "poolPingInterval", NULL, NULL, njsOracleDb_getPoolPingInterval,
@@ -320,16 +340,15 @@ const njsClassDef njsClassDefOracleDb = {
 //
 // PARAMETERS
 //   - options
-//   - JS callback which will receive (error, pool)
 //-----------------------------------------------------------------------------
 static napi_value njsOracleDb_createPool(napi_env env,
         napi_callback_info info)
 {
-    napi_value args[2];
+    napi_value args[1];
     njsBaton *baton;
 
     // verify number of arguments and create baton
-    if (!njsUtils_createBaton(env, info, 2, args, &baton))
+    if (!njsUtils_createBaton(env, info, 1, args, &baton))
         return NULL;
     baton->oracleDb = (njsOracleDb*) baton->callingInstance;
 
@@ -340,9 +359,8 @@ static napi_value njsOracleDb_createPool(napi_env env,
     }
 
     // queue work
-    njsBaton_queueWork(baton, env, "createPool", njsOracleDb_createPoolAsync,
-            njsOracleDb_createPoolPostAsync, 2);
-    return NULL;
+    return njsBaton_queueWork(baton, env, "createPool",
+            njsOracleDb_createPoolAsync, njsOracleDb_createPoolPostAsync);
 }
 
 
@@ -361,12 +379,16 @@ static bool njsOracleDb_createPoolAsync(njsBaton *baton)
         return njsBaton_setErrorDPI(baton);
     params.minSessions = baton->poolMin;
     params.maxSessions = baton->poolMax;
+    params.maxSessionsPerShard = baton->poolMaxPerShard;
     params.sessionIncrement = baton->poolIncrement;
-    params.getMode = DPI_MODE_POOL_GET_WAIT;
+    params.getMode = (baton->poolMaxPerShard > 0) ?
+            DPI_MODE_POOL_GET_TIMEDWAIT : DPI_MODE_POOL_GET_WAIT;
+    params.waitTimeout = baton->poolWaitTimeout;
     params.externalAuth = baton->externalAuth;
     params.homogeneous = baton->homogeneous;
     params.plsqlFixupCallback = baton->plsqlFixupCallback;
-    params.plsqlFixupCallbackLength = baton->plsqlFixupCallbackLength;
+    params.plsqlFixupCallbackLength =
+            (uint32_t) baton->plsqlFixupCallbackLength;
     if (params.externalAuth)
         params.homogeneous = 0;
     params.pingInterval = baton->poolPingInterval;
@@ -379,8 +401,9 @@ static bool njsOracleDb_createPoolAsync(njsBaton *baton)
 
     // create pool
     if (dpiPool_create(baton->oracleDb->context, baton->user,
-            baton->userLength, baton->password, baton->passwordLength,
-            baton->connectString, baton->connectStringLength, &commonParams,
+            (uint32_t) baton->userLength, baton->password,
+            (uint32_t) baton->passwordLength, baton->connectString,
+            (uint32_t) baton->connectStringLength, &commonParams,
             &params, &baton->dpiPoolHandle) < 0) {
         return njsBaton_setErrorDPI(baton);
     } else if (dpiPool_setTimeout(baton->dpiPoolHandle,
@@ -397,12 +420,12 @@ static bool njsOracleDb_createPoolAsync(njsBaton *baton)
 
 //-----------------------------------------------------------------------------
 // njsOracleDb_createPoolPostAsync()
-//   Creates the pool object which is returned to the JS application.
+//   Defines the value returned to JS.
 //-----------------------------------------------------------------------------
 static bool njsOracleDb_createPoolPostAsync(njsBaton *baton, napi_env env,
-        napi_value *args)
+        napi_value *result)
 {
-    return njsPool_newFromBaton(baton, env, &args[1]);
+    return njsPool_newFromBaton(baton, env, result);
 }
 
 
@@ -413,7 +436,7 @@ static bool njsOracleDb_createPoolPostAsync(njsBaton *baton, napi_env env,
 static bool njsOracleDb_createPoolProcessArgs(njsBaton *baton, napi_env env,
         napi_value *args)
 {
-    bool found;
+    bool connStrFound, connStrFound1;
 
     // initialize ODPI-C library, if necessary
     if (!njsOracleDb_initDPI(baton->oracleDb, env, baton))
@@ -422,6 +445,7 @@ static bool njsOracleDb_createPoolProcessArgs(njsBaton *baton, napi_env env,
     // set defaults on baton
     baton->homogeneous = true;
     baton->poolMax = baton->oracleDb->poolMax;
+    baton->poolMaxPerShard = baton->oracleDb->poolMaxPerShard;
     baton->poolMin = baton->oracleDb->poolMin;
     baton->poolIncrement = baton->oracleDb->poolIncrement;
     baton->poolTimeout = baton->oracleDb->poolTimeout;
@@ -442,12 +466,14 @@ static bool njsOracleDb_createPoolProcessArgs(njsBaton *baton, napi_env env,
             &baton->password, &baton->passwordLength, NULL))
         return false;
     if (!njsBaton_getStringFromArg(baton, env, args, 0, "connectString",
-            &baton->connectString, &baton->connectStringLength, &found))
+            &baton->connectString, &baton->connectStringLength, &connStrFound))
         return false;
-    if (!found && !njsBaton_getStringFromArg(baton, env, args, 0,
-            "connectionString", &baton->connectString,
-            &baton->connectStringLength, NULL))
+    if (!njsBaton_getStringFromArg(baton, env, args, 0, "connectionString",
+            &baton->connectString, &baton->connectStringLength,
+            &connStrFound1))
         return false;
+    if (connStrFound && connStrFound1)
+        return njsBaton_setError (baton, errDblConnectionString);
     if (!njsBaton_getStringFromArg(baton, env, args, 0, "edition",
             &baton->edition, &baton->editionLength, NULL))
         return false;
@@ -457,6 +483,9 @@ static bool njsOracleDb_createPoolProcessArgs(njsBaton *baton, napi_env env,
         return false;
     if (!njsBaton_getUnsignedIntFromArg(baton, env, args, 0, "poolMax",
             &baton->poolMax, NULL))
+        return false;
+    if (!njsBaton_getUnsignedIntFromArg(baton, env, args, 0, "poolMaxPerShard",
+            &baton->poolMaxPerShard, NULL))
         return false;
     if (!njsBaton_getUnsignedIntFromArg(baton, env, args, 0, "poolMin",
             &baton->poolMin, NULL))
@@ -481,6 +510,9 @@ static bool njsOracleDb_createPoolProcessArgs(njsBaton *baton, napi_env env,
         return false;
     if (!njsBaton_getBoolFromArg(baton, env, args, 0, "events",
             &baton->events, NULL))
+        return false;
+    if (!njsBaton_getUnsignedIntFromArg(baton, env, args, 0, "queueTimeout",
+            &baton->poolWaitTimeout, NULL))
         return false;
 
     return true;
@@ -539,32 +571,23 @@ static napi_value njsOracleDb_getAutoCommit(napi_env env,
 //
 // PARAMETERS
 //   - options
-//   - JS callback which will receive (error, pool)
 //-----------------------------------------------------------------------------
 static napi_value njsOracleDb_getConnection(napi_env env,
         napi_callback_info info)
 {
-    napi_value args[2];
+    napi_value args[1];
     njsBaton *baton;
 
-    // verify number of arguments and create baton
-    if (!njsUtils_createBaton(env, info, 2, args, &baton))
+    if (!njsUtils_createBaton(env, info, 1, args, &baton))
         return NULL;
     baton->oracleDb = (njsOracleDb*) baton->callingInstance;
-
-    // get information from arguments and store on the baton
     if (!njsOracleDb_getConnectionProcessArgs(baton, env, args)) {
         njsBaton_reportError(baton, env);
         return NULL;
     }
-
-    // queue work
-    if (!njsBaton_queueWork(baton, env, "GetConnection",
+    return njsBaton_queueWork(baton, env, "GetConnection",
             njsOracleDb_getConnectionAsync,
-            njsOracleDb_getConnectionPostAsync, 2))
-        return NULL;
-
-    return NULL;
+            njsOracleDb_getConnectionPostAsync);
 }
 
 
@@ -589,6 +612,13 @@ static bool njsOracleDb_getConnectionAsync(njsBaton *baton)
     params.newPasswordLength = (uint32_t) baton->newPasswordLength;
     if (!njsOracleDb_initCommonCreateParams(baton, &commonParams))
         return false;
+
+    // Sharding
+    params.shardingKeyColumns = baton->shardingKeyColumns;
+    params.numShardingKeyColumns = baton->numShardingKeyColumns;
+    params.superShardingKeyColumns = baton->superShardingKeyColumns;
+    params.numSuperShardingKeyColumns = baton->numSuperShardingKeyColumns;
+
     commonParams.edition = baton->edition;
     commonParams.editionLength = (uint32_t) baton->editionLength;
 
@@ -609,14 +639,12 @@ static bool njsOracleDb_getConnectionAsync(njsBaton *baton)
 
 //-----------------------------------------------------------------------------
 // njsOracleDb_getConnectionPostAsync()
-//   Sets up the arguments for the callback to JS. The connection object is
-// created and passed as the second argument. The first argument is always the
-// error and at this point it is known that no error has taken place.
+//   Defines the value returned to JS.
 //-----------------------------------------------------------------------------
 static bool njsOracleDb_getConnectionPostAsync(njsBaton *baton, napi_env env,
-        napi_value *args)
+        napi_value *result)
 {
-    return njsConnection_newFromBaton(baton, env, &args[1]);
+    return njsConnection_newFromBaton(baton, env, result);
 }
 
 
@@ -627,7 +655,7 @@ static bool njsOracleDb_getConnectionPostAsync(njsBaton *baton, napi_env env,
 static bool njsOracleDb_getConnectionProcessArgs(njsBaton *baton,
         napi_env env, napi_value *args)
 {
-    bool found;
+    bool connStrFound, connStrFound1;
 
     // initialize ODPI-C library, if necessary
     if (!njsOracleDb_initDPI(baton->oracleDb, env, baton))
@@ -654,13 +682,16 @@ static bool njsOracleDb_getConnectionProcessArgs(njsBaton *baton,
     if (!njsBaton_getStringFromArg(baton, env, args, 0, "password",
             &baton->password, &baton->passwordLength, NULL))
         return false;
+
     if (!njsBaton_getStringFromArg(baton, env, args, 0, "connectString",
-            &baton->connectString, &baton->connectStringLength, &found))
+            &baton->connectString, &baton->connectStringLength, &connStrFound))
         return false;
-    if (!found && !njsBaton_getStringFromArg(baton, env, args, 0,
-            "connectionString", &baton->connectString,
-            &baton->connectStringLength, NULL))
+    if (!njsBaton_getStringFromArg(baton, env, args, 0, "connectionString",
+            &baton->connectString, &baton->connectStringLength,
+            &connStrFound1))
         return false;
+    if (connStrFound && connStrFound1)
+        return njsBaton_setError (baton, errDblConnectionString );
     if (!njsBaton_getStringFromArg(baton, env, args, 0, "newPassword",
             &baton->newPassword, &baton->newPasswordLength, NULL))
         return false;
@@ -679,6 +710,14 @@ static bool njsOracleDb_getConnectionProcessArgs(njsBaton *baton,
     if (!njsBaton_getBoolFromArg(baton, env, args, 0, "events", &baton->events,
             NULL))
         return false;
+    if (!njsBaton_getShardingKeyColumnsFromArg(baton, env, args, 0,
+            "shardingKey", &baton->numShardingKeyColumns,
+            &baton->shardingKeyColumns))
+        return false;
+    if (!njsBaton_getShardingKeyColumnsFromArg(baton, env, args, 0,
+            "superShardingKey", &baton->numSuperShardingKeyColumns,
+            &baton->superShardingKeyColumns))
+        return false;
 
     return true;
 }
@@ -696,7 +735,7 @@ static napi_value njsOracleDb_getConnectionClass(napi_env env,
     if (!njsUtils_validateGetter(env, info, (njsBaseInstance**) &oracleDb))
         return NULL;
     return njsUtils_convertToString(env, oracleDb->connectionClass,
-            oracleDb->connectionClassLength);
+            (uint32_t) oracleDb->connectionClassLength);
 }
 
 
@@ -711,7 +750,7 @@ static napi_value njsOracleDb_getEdition(napi_env env, napi_callback_info info)
     if (!njsUtils_validateGetter(env, info, (njsBaseInstance**) &oracleDb))
         return NULL;
     return njsUtils_convertToString(env, oracleDb->edition,
-            oracleDb->editionLength);
+            (uint32_t) oracleDb->editionLength);
 }
 
 
@@ -880,7 +919,8 @@ static napi_value njsOracleDb_getOracleClientVersionString(napi_env env,
             versionInfo.versionNum, versionInfo.releaseNum,
             versionInfo.updateNum, versionInfo.portReleaseNum,
             versionInfo.portUpdateNum);
-    return njsUtils_convertToString(env, versionString, strlen(versionString));
+    return njsUtils_convertToString(env, versionString,
+            (uint32_t) strlen(versionString));
 }
 
 
@@ -925,6 +965,21 @@ static napi_value njsOracleDb_getPoolMax(napi_env env, napi_callback_info info)
     if (!njsUtils_validateGetter(env, info, (njsBaseInstance**) &oracleDb))
         return NULL;
     return njsUtils_convertToUnsignedInt(env, oracleDb->poolMax);
+}
+
+
+//-----------------------------------------------------------------------------
+// njsOracleDb_getPoolMaxPerShard()
+//   Get accessor of "poolMaxPerShard" property.
+//-----------------------------------------------------------------------------
+static napi_value njsOracleDb_getPoolMaxPerShard(napi_env env,
+        napi_callback_info info)
+{
+    njsOracleDb *oracleDb;
+
+    if (!njsUtils_validateGetter(env, info, (njsBaseInstance**) &oracleDb))
+        return NULL;
+    return njsUtils_convertToUnsignedInt(env, oracleDb->poolMaxPerShard);
 }
 
 
@@ -1098,7 +1153,7 @@ bool njsOracleDb_new(napi_env env, napi_value instanceObj,
 
     // allocate memory for structure and populate it with default values
     // memory is zero-ed so only non-zero values need to be set
-    oracleDb = calloc(1, sizeof(njsOracleDb));
+    oracleDb = (njsOracleDb*)calloc(1, sizeof(njsOracleDb));
     if (!oracleDb) {
         njsUtils_throwError(env, errInsufficientMemory);
         return false;
@@ -1113,7 +1168,6 @@ bool njsOracleDb_new(napi_env env, napi_value instanceObj,
     oracleDb->fetchArraySize = DPI_DEFAULT_FETCH_ARRAY_SIZE;
     oracleDb->lobPrefetchSize = NJS_LOB_PREFETCH_SIZE;
     oracleDb->poolPingInterval = NJS_POOL_DEFAULT_PING_INTERVAL;
-    oracleDb->events = true;
 
     // wrap the structure for use by JavaScript
     if (napi_wrap(env, instanceObj, oracleDb, njsOracleDb_finalize, NULL,
@@ -1121,12 +1175,6 @@ bool njsOracleDb_new(napi_env env, napi_value instanceObj,
         free(oracleDb);
         return njsUtils_genericThrowError(env);
     }
-
-    // keep a reference to the base database object class
-    NJS_CHECK_NAPI(env, napi_get_named_property(env, instanceObj,
-            "BaseDbObject", &temp))
-    NJS_CHECK_NAPI(env, napi_create_reference(env, temp, 1,
-            &oracleDb->jsBaseDbObjectConstructor))
 
     // create object for storing subscriptions
     NJS_CHECK_NAPI(env, napi_create_object(env, &temp))
@@ -1172,12 +1220,16 @@ bool njsOracleDb_prepareClass(njsOracleDb *oracleDb, napi_env env,
     if (numProperties > 0) {
 
         // allocate memory for all of the properties
-        allProperties = calloc(numProperties,
+        allProperties = (napi_property_descriptor*)calloc(numProperties,
                 sizeof(napi_property_descriptor));
         if (!allProperties) {
             njsUtils_throwError(env, errInsufficientMemory);
             return false;
         }
+
+        // store the instance on each of the properties as a convenience
+        for (i = 0; i < numProperties; i++)
+            allProperties[i].data = oracleDb;
 
         // populate the properties
         memcpy(allProperties, classDef->properties,
@@ -1507,6 +1559,27 @@ static napi_value njsOracleDb_setPoolMax(napi_env env, napi_callback_info info)
         return NULL;
     if (!njsUtils_setPropUnsignedInt(env, value, "poolMax",
             &oracleDb->poolMax))
+        return NULL;
+
+    return NULL;
+}
+
+
+//-----------------------------------------------------------------------------
+// njsOracleDb_setPoolMaxPerShard()
+//   Set accessor of "poolMaxPerShard" property.
+//-----------------------------------------------------------------------------
+static napi_value njsOracleDb_setPoolMaxPerShard(napi_env env,
+        napi_callback_info info)
+{
+    njsOracleDb *oracleDb;
+    napi_value value;
+
+    if (!njsUtils_validateSetter(env, info, (njsBaseInstance**) &oracleDb,
+            &value))
+        return NULL;
+    if (!njsUtils_setPropUnsignedInt(env, value, "poolMaxPerShard",
+            &oracleDb->poolMaxPerShard))
         return NULL;
 
     return NULL;

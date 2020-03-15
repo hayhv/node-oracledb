@@ -44,7 +44,7 @@ static napi_value njsModule_externalInit(napi_env env, napi_callback_info info)
         return NULL;
     }
     if (actualArgs != 1) {
-        njsUtils_throwError(env, errInvalidNumberOfParameters);
+        njsUtils_throwError(env, errInvalidNumberOfParameters, actualArgs, 1);
         return NULL;
     }
 
@@ -67,6 +67,9 @@ static napi_value njsModule_externalInit(napi_env env, napi_callback_info info)
         return NULL;
     if (!njsOracleDb_prepareClass(oracleDb, env, instance,
             &njsClassDefAqQueue, &oracleDb->jsAqQueueConstructor))
+        return NULL;
+    if (!njsOracleDb_prepareClass(oracleDb, env, instance,
+            &njsClassDefBaseDbObject, &oracleDb->jsBaseDbObjectConstructor))
         return NULL;
     if (!njsOracleDb_prepareClass(oracleDb, env, instance,
             &njsClassDefConnection, &oracleDb->jsConnectionConstructor))

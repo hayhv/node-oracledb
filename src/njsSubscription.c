@@ -287,7 +287,7 @@ bool njsSubscription_new(njsBaton *baton, napi_env env, napi_value *obj,
 {
     njsSubscription *tempSubscr;
 
-    tempSubscr = calloc(1, sizeof(njsSubscription));
+    tempSubscr = (njsSubscription*)calloc(1, sizeof(njsSubscription));
     if (!tempSubscr)
         return njsBaton_setError(baton, errInsufficientMemory);
     if (napi_create_external(env, tempSubscr, njsSubscription_finalize,

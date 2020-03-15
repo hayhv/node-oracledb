@@ -55,12 +55,12 @@ static const char *njsErrorMessages[] = {
     "NJS-041: cannot convert ResultSet to QueryStream after invoking methods", // errCannotConvertRsToStream
     "NJS-042: cannot invoke ResultSet methods after converting to QueryStream", // errCannotInvokeRsMethods
     "NJS-043: ResultSet already converted to QueryStream", // errResultSetAlreadyConverted
-    "NJS-044: named JSON object is not expected in this context", // errNamedJSON
+    "NJS-044: bind object must contain one of the following keys: \"dir\", \"type\", \"maxSize\", or \"val\"", // errNamedJSON
     "NJS-045: cannot load a node-oracledb binary for Node.js %s", // errCannotLoadBinary
     "NJS-046: pool alias \"%s\" already exists in the connection pool cache", // errPoolWithAliasAlreadyExists
     "NJS-047: pool alias \"%s\" not found in connection pool cache", // errPoolWithAliasNotFound
     "NJS-052: invalid data type at array index %d for bind position %d", // errIncompatibleTypeArrayIndexBind
-    "NJS-053: array value expected, a non-array value provided", //errNonArrayProvided
+    "NJS-053: an array value was expected", //errNonArrayProvided
     "NJS-055: binding by position and name cannot be mixed", // errMixedBind
     "NJS-056: maxSize must be specified and not zero for bind position %u", // errMissingMaxSizeByPos
     "NJS-057: maxSize must be specified and not zero for bind \"%.*s\"", // errMissingMaxSizeByName
@@ -81,6 +81,8 @@ static const char *njsErrorMessages[] = {
     "NJS-072: cannot convert from attribute \"%.*s\" of type \"%.*s\" to JavaScript value", // errConvertFromObjAttr
     "NJS-073: cannot convert from JavaScript value to element of type %.*s", // errConvertToObjElement
     "NJS-074: cannot convert from JavaScript value to attribute \"%.*s\" of type \"%.*s\"", // errConvertToObjAttr
+    "NJS-075: only one of connectString and connectionString can be used", // errDblConnectionString
+    "NJS-076: connection request rejected. Pool queue length queueMax %d reached", // errQueueMax
 };
 
 

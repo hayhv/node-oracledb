@@ -1,4 +1,4 @@
-// Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
+// Copyright (c) 2015, 2020, Oracle and/or its affiliates. All rights reserved.
 
 //-----------------------------------------------------------------------------
 //
@@ -27,7 +27,9 @@
 
 // methods used internally
 static bool njsBaton_completeAsyncHelper(njsBaton *baton, napi_env env,
-        napi_value *callback, napi_value *callingObj);
+        napi_value *resolution);
+static void njsBaton_freeShardingKeys(uint8_t *numShardingKeyColumns,
+        dpiShardingKeyColumn **shardingKeyColumns);
 
 
 //-----------------------------------------------------------------------------
@@ -40,30 +42,21 @@ static bool njsBaton_completeAsyncHelper(njsBaton *baton, napi_env env,
 static void njsBaton_completeAsync(napi_env env, napi_status ignoreStatus,
         void *data)
 {
-    napi_value callback, callingObj, *callbackArgs;
     njsBaton *baton = (njsBaton*) data;
-    size_t numCallbackArgs;
     napi_status status;
+    napi_value result;
 
     // call helper to perform actual work; report error if any occurs
-    if (!njsBaton_completeAsyncHelper(baton, env, &callback, &callingObj)) {
+    if (!njsBaton_completeAsyncHelper(baton, env, &result)) {
         njsBaton_reportError(baton, env);
         return;
     }
 
-    // destroy baton as it is no longer needed, but save a copy of the callback
-    // arguments so they be used
-    numCallbackArgs = baton->numCallbackArgs;
-    callbackArgs = baton->callbackArgs;
-    baton->callbackArgs = NULL;
-    njsBaton_free(baton, env);
-
-    // invoke callback
-    status = napi_call_function(env, callingObj, callback, numCallbackArgs,
-            callbackArgs, NULL);
-    free(callbackArgs);
+    // resolve promise
+    status = napi_resolve_deferred(env, baton->deferred, result);
     if (status != napi_ok)
         njsUtils_genericThrowError(env);
+    njsBaton_free(baton, env);
 }
 
 
@@ -73,41 +66,20 @@ static void njsBaton_completeAsync(napi_env env, napi_status ignoreStatus,
 // for invoking the callback.
 //-----------------------------------------------------------------------------
 static bool njsBaton_completeAsyncHelper(njsBaton *baton, napi_env env,
-        napi_value *callback, napi_value *callingObj)
+        napi_value *result)
 {
-    size_t i;
-
     // if an error already occurred during the asynchronous processing, nothing
     // to do
     if (baton->hasError)
         return false;
 
-    // allocate memory for the arguments
-    baton->callbackArgs = calloc(baton->numCallbackArgs, sizeof(napi_value));
-    if (!baton->callbackArgs)
-        return njsBaton_setError(baton, errInsufficientMemory);
-
-    // the first parameter should always be null (the error message)
-    // all other values should be undefined unless otherwise specified
-    NJS_CHECK_NAPI(env, napi_get_null(env, &baton->callbackArgs[0]))
-    for (i = 1; i < baton->numCallbackArgs; i++) {
-        NJS_CHECK_NAPI(env, napi_get_undefined(env, &baton->callbackArgs[i]))
-    }
-
-    // call the completion callback and if an error occurred, nothing further
-    // to do
+    // if an after work callback has been specified, call it to determine what
+    // the result should be; the default value is undefined
+    NJS_CHECK_NAPI(env, napi_get_undefined(env, result))
     if (baton->afterWorkCallback) {
-        if (!baton->afterWorkCallback(baton, env, baton->callbackArgs))
+        if (!baton->afterWorkCallback(baton, env, result))
             return false;
     }
-
-    // acquire callback from reference stored on the baton
-    NJS_CHECK_NAPI(env, napi_get_reference_value(env, baton->jsCallback,
-            callback))
-
-    // acquire calling object from reference stored on the baton
-    NJS_CHECK_NAPI(env, napi_get_reference_value(env, baton->jsCallingObj,
-            callingObj))
 
     return true;
 }
@@ -121,7 +93,6 @@ static bool njsBaton_completeAsyncHelper(njsBaton *baton, napi_env env,
 bool njsBaton_create(njsBaton *baton, napi_env env, napi_callback_info info,
         size_t numArgs, napi_value *args)
 {
-    napi_valuetype argType;
     napi_value callingObj;
 
     // validate the number of args required for the asynchronous function
@@ -130,22 +101,10 @@ bool njsBaton_create(njsBaton *baton, napi_env env, napi_callback_info info,
             &baton->callingInstance))
         return false;
 
-    // verify that the final argument is a function
-    argType = napi_undefined;
-    if (numArgs > 0) {
-        NJS_CHECK_NAPI(env, napi_typeof(env, args[numArgs - 1], &argType))
-    }
-    if (argType != napi_function)
-        return njsUtils_throwError(env, errMissingCallback);
-
     // save a reference to the calling object so that it will not be garbage
     // collected during the asynchronous call
     NJS_CHECK_NAPI(env, napi_create_reference(env, callingObj, 1,
             &baton->jsCallingObj))
-
-    // save a reference to the callback
-    NJS_CHECK_NAPI(env, napi_create_reference(env, args[numArgs - 1], 1,
-            &baton->jsCallback))
 
     return true;
 }
@@ -213,6 +172,7 @@ void njsBaton_free(njsBaton *baton, napi_env env)
     NJS_FREE_AND_CLEAR(baton->key);
     NJS_FREE_AND_CLEAR(baton->filter);
     NJS_FREE_AND_CLEAR(baton->version);
+    NJS_FREE_AND_CLEAR(baton->pfile);
 
     // free and clear various buffers
     NJS_FREE_AND_CLEAR(baton->bindNames);
@@ -351,15 +311,42 @@ void njsBaton_free(njsBaton *baton, napi_env env)
     // remove references to JS objects
     NJS_DELETE_REF_AND_CLEAR(baton->jsBuffer);
     NJS_DELETE_REF_AND_CLEAR(baton->jsCallingObj);
-    NJS_DELETE_REF_AND_CLEAR(baton->jsCallback);
     NJS_DELETE_REF_AND_CLEAR(baton->jsSubscription);
     if (baton->asyncWork) {
         napi_delete_async_work(env, baton->asyncWork);
         baton->asyncWork = NULL;
     }
-    NJS_FREE_AND_CLEAR(baton->callbackArgs);
+
+    // free sharding and super sharding keys
+    njsBaton_freeShardingKeys(&baton->numShardingKeyColumns,
+            &baton->shardingKeyColumns);
+    njsBaton_freeShardingKeys(&baton->numSuperShardingKeyColumns,
+            &baton->superShardingKeyColumns);
 
     free(baton);
+}
+
+
+//-----------------------------------------------------------------------------
+// njsBaton_freeShardingKeys()
+//   To clean up array of ShardingKeys
+//-----------------------------------------------------------------------------
+void njsBaton_freeShardingKeys(uint8_t *numShardingKeyColumns,
+        dpiShardingKeyColumn **shardingKeyColumns)
+{
+    dpiShardingKeyColumn *shards = *shardingKeyColumns;
+    uint32_t i;
+
+    for (i = 0; i < *numShardingKeyColumns; i++) {
+        if (shards[i].oracleTypeNum == DPI_ORACLE_TYPE_VARCHAR &&
+                shards[i].value.asBytes.ptr) {
+            free(shards[i].value.asBytes.ptr);
+            shards[i].value.asBytes.ptr = NULL;
+        }
+    }
+    free(shards);
+    *numShardingKeyColumns = 0;
+    *shardingKeyColumns = NULL;
 }
 
 
@@ -392,8 +379,8 @@ bool njsBaton_getBoolFromArg(njsBaton *baton, napi_env env, napi_value *args,
 // false is returned, the callback should not be invoked; instead an exception
 // will be passed on to JavaScript.
 //-----------------------------------------------------------------------------
-bool njsBaton_getErrorInfo(njsBaton *baton, napi_env env, napi_value *error,
-        napi_value *callingObj, napi_value *callback)
+static bool njsBaton_getErrorInfo(njsBaton *baton, napi_env env,
+        napi_value *error)
 {
     napi_value tempString, tempError;
     dpiErrorInfo *errorInfo;
@@ -404,6 +391,8 @@ bool njsBaton_getErrorInfo(njsBaton *baton, napi_env env, napi_value *error,
     // pass it through to the callback
     NJS_CHECK_NAPI(env, napi_is_exception_pending(env, &isPending))
     if (isPending) {
+        if (!baton->deferred)
+            return false;
         baton->dpiError = false;
         NJS_CHECK_NAPI(env, napi_get_and_clear_last_exception(env, &tempError))
         NJS_CHECK_NAPI(env, napi_coerce_to_string(env, tempError, &tempString))
@@ -415,14 +404,6 @@ bool njsBaton_getErrorInfo(njsBaton *baton, napi_env env, napi_value *error,
     errorInfo = (baton->dpiError) ? &baton->errorInfo : NULL;
     if (!njsUtils_getError(env, errorInfo, baton->error, error))
         return false;
-
-    // acquire callback from reference stored on the baton
-    NJS_CHECK_NAPI(env, napi_get_reference_value(env, baton->jsCallback,
-            callback))
-
-    // acquire calling object from reference stored on the baton
-    NJS_CHECK_NAPI(env, napi_get_reference_value(env, baton->jsCallingObj,
-            callingObj))
 
     return true;
 }
@@ -457,8 +438,8 @@ bool njsBaton_getFetchInfoFromArg(njsBaton *baton, napi_env env,
 
     // allocate space for the fetchInfo based on the number of keys
     NJS_CHECK_NAPI(env, napi_get_array_length(env, keys, &numElements))
-    tempFetchInfo = calloc(numElements, sizeof(njsFetchInfo));
-    if (!tempFetchInfo)
+    tempFetchInfo = (njsFetchInfo*)calloc(numElements, sizeof(njsFetchInfo));
+    if (!tempFetchInfo && numElements > 0)
         return njsBaton_setError(baton, errInsufficientMemory);
     *numFetchInfo = numElements;
     *fetchInfo = tempFetchInfo;
@@ -541,6 +522,109 @@ uint32_t njsBaton_getNumOutBinds(njsBaton *baton)
 
 
 //-----------------------------------------------------------------------------
+// njsBaton_getShardingKeyColumnsFromArg()
+//   Gets an array of sharding key columns from the specified JavaScript object
+// property, if possible. If the given property is undefined, no error is set
+// and the value is left untouched; otherwise, if the value is not an array,
+// the error is set on the baton.
+//-----------------------------------------------------------------------------
+bool njsBaton_getShardingKeyColumnsFromArg(njsBaton *baton, napi_env env,
+        napi_value *args, int argIndex, const char *propertyName,
+        uint8_t *numShardingKeyColumns,
+        dpiShardingKeyColumn **shardingKeyColumns)
+{
+    napi_value asNumber, value, element;
+    dpiShardingKeyColumn *shards;
+    napi_valuetype valueType;
+    uint32_t arrLen, i;
+    size_t numBytes;
+    bool check;
+
+    // validate parameter
+    if (!njsBaton_getValueFromArg(baton, env, args, argIndex, propertyName,
+            napi_object, &value, NULL))
+        return false;
+    if (!value)
+        return true;
+    NJS_CHECK_NAPI(env, napi_is_array(env, value, &check))
+    if (!check)
+        return njsBaton_setError(baton, errNonArrayProvided);
+
+    // allocate space for sharding key columns; if array is empty, nothing
+    // further to do!
+    NJS_CHECK_NAPI(env, napi_get_array_length(env, value, &arrLen))
+    if (arrLen == 0)
+        return true;
+    shards = (dpiShardingKeyColumn*)calloc(arrLen, sizeof(dpiShardingKeyColumn));
+    if (!shards)
+        return njsBaton_setError(baton, errInsufficientMemory);
+    *shardingKeyColumns = shards;
+    *numShardingKeyColumns = (uint8_t)arrLen;
+
+    // process each element
+    for (i = 0; i < arrLen; i++) {
+        NJS_CHECK_NAPI(env, napi_get_element(env, value, i, &element))
+        NJS_CHECK_NAPI(env, napi_typeof(env, element, &valueType))
+
+        // handle strings
+        if (valueType == napi_string) {
+            shards[i].nativeTypeNum = DPI_NATIVE_TYPE_BYTES;
+            shards[i].oracleTypeNum = DPI_ORACLE_TYPE_VARCHAR;
+            if (!njsUtils_copyStringFromJS(env, element,
+                    &shards[i].value.asBytes.ptr, &numBytes))
+                return false;
+            shards[i].value.asBytes.length = (uint32_t) numBytes;
+            continue;
+        }
+
+        // handle numbers
+        if (valueType == napi_number) {
+            shards[i].nativeTypeNum = DPI_NATIVE_TYPE_DOUBLE;
+            shards[i].oracleTypeNum = DPI_ORACLE_TYPE_NUMBER;
+            NJS_CHECK_NAPI(env, napi_get_value_double(env, element,
+                    &shards[i].value.asDouble));
+            continue;
+        }
+
+        // handle objects
+        if (valueType == napi_object) {
+
+            // handle buffers
+            NJS_CHECK_NAPI(env, napi_is_buffer(env, element, &check))
+            if (check) {
+                shards[i].nativeTypeNum = DPI_NATIVE_TYPE_BYTES;
+                shards[i].oracleTypeNum = DPI_ORACLE_TYPE_RAW;
+                NJS_CHECK_NAPI(env, napi_get_buffer_info(env, element,
+                        (void**) &shards[i].value.asBytes.ptr, &numBytes))
+                shards[i].value.asBytes.length = (uint32_t) numBytes;
+                continue;
+            }
+
+            // handle dates
+            if (!njsBaton_isDate(baton, env, element, &check))
+                return false;
+            if (check) {
+                shards[i].nativeTypeNum = DPI_NATIVE_TYPE_DOUBLE;
+                shards[i].oracleTypeNum = DPI_ORACLE_TYPE_DATE;
+                NJS_CHECK_NAPI(env, napi_coerce_to_number(env, element,
+                        &asNumber))
+                NJS_CHECK_NAPI(env, napi_get_value_double(env, asNumber,
+                        &shards[i].value.asDouble))
+                continue;
+            }
+
+        }
+
+        // no support for other types
+        return njsBaton_setError(baton, errInvalidPropertyValueInParam,
+                propertyName, argIndex + 1);
+    }
+
+    return true;
+}
+
+
+//-----------------------------------------------------------------------------
 // njsBaton_getSodaDocument()
 //   Examines the passed object. If it is a SODA document object, a reference
 // to it is retained; otherwise, a buffer is assumed to be passed and a new
@@ -575,8 +659,9 @@ bool njsBaton_getSodaDocument(njsBaton *baton, njsSodaDatabase *db,
     } else {
         NJS_CHECK_NAPI(env, napi_get_buffer_info(env, obj, &content,
                 &contentLength))
-        if (dpiSodaDb_createDocument(db->handle, NULL, 0, content,
-                contentLength, NULL, 0, DPI_SODA_FLAGS_DEFAULT, handle) < 0)
+        if (dpiSodaDb_createDocument(db->handle, NULL, 0, (const char*)content,
+                (uint32_t) contentLength, NULL, 0, DPI_SODA_FLAGS_DEFAULT,
+                handle) < 0)
             return njsBaton_setErrorDPI(baton);
     }
 
@@ -628,15 +713,18 @@ bool njsBaton_getStringArrayFromArg(njsBaton *baton, napi_env env,
     if (!array)
         return true;
 
-    // get length of array
+    // get length of array; if there are no elements in the array, nothing
+    // further needs to be done
     NJS_CHECK_NAPI(env, napi_get_array_length(env, array, &arrayLength))
+    if (arrayLength == 0)
+        return true;
 
     // allocate memory for the results
-    tempStrings = calloc(arrayLength, sizeof(char*));
+    tempStrings = (char**)calloc(arrayLength, sizeof(char*));
     if (!tempStrings)
         return njsBaton_setError(baton, errInsufficientMemory);
     *resultElems = tempStrings;
-    tempLengths = calloc(arrayLength, sizeof(uint32_t));
+    tempLengths = (uint32_t*)calloc(arrayLength, sizeof(uint32_t));
     if (!tempLengths)
         return njsBaton_setError(baton, errInsufficientMemory);
     *resultElemLengths = tempLengths;
@@ -779,7 +867,7 @@ bool njsBaton_isBindValue(njsBaton *baton, napi_env env, napi_value value)
         return false;
     if (valueType != napi_undefined && valueType != napi_null &&
             valueType != napi_number && valueType != napi_string &&
-            valueType != napi_object)
+            valueType != napi_object && valueType != napi_boolean)
         return false;
     if (valueType != napi_object)
         return true;
@@ -799,7 +887,9 @@ bool njsBaton_isBindValue(njsBaton *baton, napi_env env, napi_value value)
         return true;
 
     // dates can be bound directly
-    if (njsBaton_isDate(baton, env, value))
+    if (!njsBaton_isDate(baton, env, value, &check))
+        return false;
+    if (check)
         return true;
 
     // LOBs can be bound directly
@@ -823,17 +913,24 @@ bool njsBaton_isBindValue(njsBaton *baton, napi_env env, napi_value value)
 
 //-----------------------------------------------------------------------------
 // njsBaton_isDate()
-//   Returns a boolean indicating if the value refers to a date or not.
+//   Returns a boolean indicating if the value refers to a date or not. This
+// can be replaced by napi_is_date() once it is available in all LTS releases.
 //-----------------------------------------------------------------------------
-bool njsBaton_isDate(njsBaton *baton, napi_env env, napi_value value)
+bool njsBaton_isDate(njsBaton *baton, napi_env env, napi_value value,
+        bool *isDate)
 {
-    napi_status status;
-    bool check;
+    napi_value isDateObj;
 
-    status = napi_instanceof(env, value, baton->jsDateConstructor, &check);
-    if (status != napi_ok)
-        return false;
-    return check;
+    if (!baton->jsIsDateObj) {
+        NJS_CHECK_NAPI(env, napi_get_reference_value(env, baton->jsCallingObj,
+                &baton->jsIsDateObj))
+        NJS_CHECK_NAPI(env, napi_get_named_property(env, baton->jsIsDateObj,
+                "_isDate", &baton->jsIsDateMethod))
+    }
+    NJS_CHECK_NAPI(env, napi_call_function(env, baton->jsIsDateObj,
+            baton->jsIsDateMethod, 1, &value, &isDateObj))
+    NJS_CHECK_NAPI(env, napi_get_value_bool(env, isDateObj, isDate))
+    return true;
 }
 
 
@@ -843,24 +940,22 @@ bool njsBaton_isDate(njsBaton *baton, napi_env env, napi_value value)
 // method fails for some reason, the baton is destroyed and is no longer
 // usable.
 //-----------------------------------------------------------------------------
-bool njsBaton_queueWork(njsBaton *baton, napi_env env, const char *methodName,
-        bool (*workCallback)(njsBaton*),
-        bool (*afterWorkCallback)(njsBaton*, napi_env, napi_value*),
-        unsigned int numCallbackArgs)
+napi_value njsBaton_queueWork(njsBaton *baton, napi_env env,
+        const char *methodName, bool (*workCallback)(njsBaton*),
+        bool (*afterWorkCallback)(njsBaton*, napi_env, napi_value*))
 {
-    napi_value asyncResourceName;
+    napi_value asyncResourceName, promise;
 
     // save the methods that will be used to perform the asynchronous work
     baton->workCallback = workCallback;
     baton->afterWorkCallback = afterWorkCallback;
-    baton->numCallbackArgs = numCallbackArgs;
 
     // create the async resource name
     if (napi_create_string_utf8(env, methodName, NAPI_AUTO_LENGTH,
             &asyncResourceName) != napi_ok) {
         njsUtils_genericThrowError(env);
         njsBaton_free(baton, env);
-        return false;
+        return NULL;
     }
 
     // create the asynchronous work handle
@@ -869,17 +964,25 @@ bool njsBaton_queueWork(njsBaton *baton, napi_env env, const char *methodName,
             &baton->asyncWork) != napi_ok) {
         njsUtils_genericThrowError(env);
         njsBaton_free(baton, env);
-        return false;
+        return NULL;
+    }
+
+    // create a promise which will be returned to JavaScript
+    if (napi_create_promise(env, &baton->deferred, &promise) != napi_ok) {
+        njsUtils_genericThrowError(env);
+        njsBaton_free(baton, env);
+        return NULL;
     }
 
     // queue the asynchronous work
     if (napi_queue_async_work(env, baton->asyncWork) != napi_ok) {
+        napi_reject_deferred(env, baton->deferred, NULL);
         njsUtils_genericThrowError(env);
         njsBaton_free(baton, env);
-        return false;
+        return NULL;
     }
 
-    return true;
+    return promise;
 }
 
 
@@ -895,16 +998,19 @@ bool njsBaton_queueWork(njsBaton *baton, napi_env env, const char *methodName,
 //-----------------------------------------------------------------------------
 void njsBaton_reportError(njsBaton *baton, napi_env env)
 {
-    napi_value error, callback, callingObj;
+    napi_value error;
     bool ok;
 
-    ok = njsBaton_getErrorInfo(baton, env, &error, &callingObj, &callback);
-    njsBaton_free(baton, env);
+    ok = njsBaton_getErrorInfo(baton, env, &error);
     if (ok) {
-        if (napi_call_function(env, callingObj, callback, 1, &error,
-                NULL) != napi_ok)
-            njsUtils_genericThrowError(env);
+        if (baton->deferred) {
+            if (napi_reject_deferred(env, baton->deferred, error) != napi_ok)
+                njsUtils_genericThrowError(env);
+        } else {
+            napi_throw(env, error);
+        }
     }
+    njsBaton_free(baton, env);
 }
 
 

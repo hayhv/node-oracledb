@@ -274,8 +274,8 @@ bool njsUtils_copyArray(napi_env env, void *sourceArray, uint32_t numElements,
 bool njsUtils_copyString(napi_env env, char *source, size_t sourceLength,
         char **dest, size_t *destLength)
 {
-    if (source) {
-        *dest = malloc(sourceLength);
+    if (source && sourceLength > 0) {
+        *dest = (char*)malloc(sourceLength);
         if (!*dest)
             return njsUtils_throwError(env, errInsufficientMemory);
         memcpy(*dest, source, sourceLength);
@@ -301,7 +301,7 @@ bool njsUtils_copyStringFromJS(napi_env env, napi_value value, char **result,
     // allocate memory to store the string
     if (*result)
         free(*result);
-    *result = malloc(*resultLength + 1);
+    *result = (char*)malloc(*resultLength + 1);
     if (!*result)
         return njsUtils_throwError(env, errInsufficientMemory);
 
@@ -330,7 +330,7 @@ bool njsUtils_createBaton(napi_env env, napi_callback_info info,
         args = &callback;
 
     // allocate and zero memory
-    tempBaton = calloc(1, sizeof(njsBaton));
+    tempBaton = (njsBaton*)calloc(1, sizeof(njsBaton));
     if (!tempBaton) {
         njsUtils_throwError(env, errInsufficientMemory);
         return false;
@@ -416,6 +416,22 @@ bool njsUtils_genericThrowError(napi_env env)
         napi_throw_error(env, NULL, errorMessage);
     }
     return false;
+}
+
+
+//-----------------------------------------------------------------------------
+// njsUtils_getBoolArg()
+//   Gets a boolean from the specified parameter. If the value is not a
+// boolean, an error is raised and false is returned.
+//-----------------------------------------------------------------------------
+bool njsUtils_getBoolArg(napi_env env, napi_value *args, int index,
+        bool *result)
+{
+    if (!njsUtils_validateArgType(env, args, napi_boolean, index))
+        return false;
+    NJS_CHECK_NAPI(env, napi_get_value_bool(env, args[index], result))
+
+    return true;
 }
 
 
@@ -764,8 +780,8 @@ bool njsUtils_setPropUnsignedIntArray(napi_env env, napi_value value,
 
     // allocate memory for array, if applicable
     NJS_CHECK_NAPI(env, napi_get_array_length(env, value, &numElements))
-    elements = calloc(numElements, sizeof(uint32_t));
-    if (!elements)
+    elements = (uint32_t*)calloc(numElements, sizeof(uint32_t));
+    if (!elements && numElements > 0)
         return njsUtils_throwError(env, errInsufficientMemory);
 
     // validate values in the array
@@ -855,7 +871,8 @@ bool njsUtils_validateArgs(napi_env env, napi_callback_info info,
     NJS_CHECK_NAPI(env, napi_get_cb_info(env, info, &actualArgs, args,
             &thisArg, NULL))
     if (actualArgs != numArgs)
-        return njsUtils_throwError(env, errInvalidNumberOfParameters);
+        return njsUtils_throwError(env, errInvalidNumberOfParameters,
+                                   actualArgs, numArgs);
 
     // unwrap instance
     NJS_CHECK_NAPI(env, napi_unwrap(env, thisArg, (void**) instance))

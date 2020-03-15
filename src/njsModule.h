@@ -1,4 +1,4 @@
-// Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
+// Copyright (c) 2019, 2020, Oracle and/or its affiliates. All rights reserved.
 
 //-----------------------------------------------------------------------------
 //
@@ -39,10 +39,10 @@
 // Keep the version in sync with package.json.
 // The suffix should be something like "-dev" or "-beta.1".
 // For production, use: #define NJS_NODE_ORACLEDB_SUFFIX ""
-#define NJS_NODE_ORACLEDB_MAJOR       4
+#define NJS_NODE_ORACLEDB_MAJOR       5
 #define NJS_NODE_ORACLEDB_MINOR       0
-#define NJS_NODE_ORACLEDB_PATCH       1
-#define NJS_NODE_ORACLEDB_SUFFIX      ""
+#define NJS_NODE_ORACLEDB_PATCH       0
+#define NJS_NODE_ORACLEDB_SUFFIX      "-dev"
 
 // define stringified version and driver name
 #define NJS_STR_HELPER(x)       #x
@@ -131,7 +131,9 @@
 #define NJS_DATATYPE_CURSOR             DPI_ORACLE_TYPE_STMT
 #define NJS_DATATYPE_BUFFER             DPI_ORACLE_TYPE_RAW
 #define NJS_DATATYPE_CLOB               DPI_ORACLE_TYPE_CLOB
+#define NJS_DATATYPE_NCLOB              DPI_ORACLE_TYPE_NCLOB
 #define NJS_DATATYPE_BLOB               DPI_ORACLE_TYPE_BLOB
+#define NJS_DATATYPE_BOOLEAN            DPI_ORACLE_TYPE_BOOLEAN
 #define NJS_DATATYPE_OBJECT             DPI_ORACLE_TYPE_OBJECT
 
 // error messages used within the driver
@@ -191,6 +193,9 @@ typedef enum {
     errConvertFromObjAttr,
     errConvertToObjElement,
     errConvertToObjAttr,
+    errDblConnectionString,
+    errQueueMax,
+
 
     // New ones should be added here
 
@@ -253,6 +258,7 @@ extern const njsClassDef njsClassDefAqDeqOptions;
 extern const njsClassDef njsClassDefAqEnqOptions;
 extern const njsClassDef njsClassDefAqMessage;
 extern const njsClassDef njsClassDefAqQueue;
+extern const njsClassDef njsClassDefBaseDbObject;
 extern const njsClassDef njsClassDefConnection;
 extern const njsClassDef njsClassDefLob;
 extern const njsClassDef njsClassDefOracleDb;
@@ -359,6 +365,8 @@ struct njsBaton {
     size_t filterLength;
     char *version;
     size_t versionLength;
+    char *pfile;                             // for DB startup
+    size_t pfileLength;
 
     // various buffers (requires free)
     uint32_t numBindNames;
@@ -420,8 +428,10 @@ struct njsBaton {
     // integer values
     uint32_t poolMin;
     uint32_t poolMax;
+    uint32_t poolMaxPerShard;
     uint32_t poolIncrement;
     uint32_t poolTimeout;
+    uint32_t poolWaitTimeout;
     int32_t poolPingInterval;
     uint32_t stmtCacheSize;
     uint32_t maxRows;
@@ -445,11 +455,14 @@ struct njsBaton {
     uint32_t subscrGroupingClass;
     uint32_t subscrGroupingValue;
     uint32_t subscrGroupingType;
+    uint32_t shutdownMode;
+    uint32_t startupMode;
 
     // boolean values
     bool externalAuth;
     bool homogeneous;
-    bool getRS;
+    bool closeOnFetch;
+    bool closeOnAllRowsFetched;
     bool autoCommit;
     bool extendedMetaData;
     bool events;
@@ -461,6 +474,7 @@ struct njsBaton {
     bool isDropped;
     bool replaced;
     bool force;
+    bool clientInitiated;
 
     // LOB buffer (requires free only if string was used)
     uint64_t bufferSize;
@@ -469,11 +483,24 @@ struct njsBaton {
     // subscriptions (no free required)
     njsSubscription *subscription;
 
+    // sharding (requires free)
+    dpiShardingKeyColumn *shardingKeyColumns;
+    dpiShardingKeyColumn *superShardingKeyColumns;
+    uint8_t  numShardingKeyColumns;
+    uint8_t  numSuperShardingKeyColumns;
+
     // references that are held (requires free)
     napi_ref jsBuffer;
     napi_ref jsCallingObj;
-    napi_ref jsCallback;
     napi_ref jsSubscription;
+
+    // values required to check if a value is a date; this is only used when
+    // binding data in connection.execute() and connection.executeMany() and
+    // when managing sharding keys (when getting a connection); this can be
+    // replaced with calls to napi_is_date() when it is available for all LTS
+    // releases
+    napi_value jsIsDateObj;
+    napi_value jsIsDateMethod;
 
     // constructors
     napi_value jsDateConstructor;
@@ -484,8 +511,7 @@ struct njsBaton {
     napi_async_work asyncWork;
     bool (*workCallback)(njsBaton*);
     bool (*afterWorkCallback)(njsBaton*, napi_env, napi_value*);
-    napi_value *callbackArgs;
-    unsigned int numCallbackArgs;
+    napi_deferred deferred;
 };
 
 // data for class definitions exposed to JS
@@ -563,6 +589,7 @@ struct njsOracleDb {
     uint32_t fetchArraySize;
     uint32_t poolMin;
     uint32_t poolMax;
+    uint32_t poolMaxPerShard;
     uint32_t poolIncrement;
     uint32_t poolTimeout;
     uint32_t lobPrefetchSize;
@@ -604,6 +631,7 @@ struct njsPool {
     njsOracleDb *oracleDb;
     uint32_t poolMin;
     uint32_t poolMax;
+    uint32_t poolMaxPerShard;
     uint32_t poolIncrement;
     uint32_t poolTimeout;
     uint32_t stmtCacheSize;
@@ -617,10 +645,11 @@ struct njsResultSet {
     njsConnection *conn;
     uint32_t numQueryVars;
     njsVariable *queryVars;
+    uint32_t fetchArraySize;
     uint32_t outFormat;
-    uint32_t maxRows;
     bool extendedMetaData;
-    bool autoClose;
+    bool isNested;
+    bool varsDefined;
 };
 
 // data for class SodaCollection exposed to JS.
@@ -686,7 +715,6 @@ struct njsVariable {
     njsDbObjectType *objectType;
     dpiVar *dpiVarHandle;
     uint32_t bindDir;
-    uint32_t bindDataType;
     uint32_t maxArraySize;
     uint32_t maxSize;
     uint32_t dbSizeInBytes;
@@ -765,14 +793,15 @@ bool njsBaton_createDate(njsBaton *baton, napi_env env, double value,
 void njsBaton_free(njsBaton *baton, napi_env env);
 bool njsBaton_getBoolFromArg(njsBaton *baton, napi_env env, napi_value *args,
         int argIndex, const char *propertyName, bool *result, bool *found);
-bool njsBaton_getErrorInfo(njsBaton *baton, napi_env env, napi_value *error,
-        napi_value *callingObj, napi_value *callback);
 bool njsBaton_getFetchInfoFromArg(njsBaton *baton, napi_env env,
         napi_value *args, int argIndex, const char *propertyName,
         uint32_t *numFetchInfo, njsFetchInfo **fetchInfo, bool *found);
 bool njsBaton_getIntFromArg(njsBaton *baton, napi_env env, napi_value *args,
         int argIndex, const char *propertyName, int32_t *result, bool *found);
 uint32_t njsBaton_getNumOutBinds(njsBaton *baton);
+bool njsBaton_getShardingKeyColumnsFromArg(njsBaton *baton, napi_env env,
+        napi_value *args, int argIndex, const char *propertyName,
+        uint8_t *numShardKeys, dpiShardingKeyColumn **shards);
 bool njsBaton_getSodaDocument(njsBaton *baton, njsSodaDatabase *db,
         napi_env env, napi_value obj, dpiSodaDoc **handle);
 bool njsBaton_getStringFromArg(njsBaton *baton, napi_env env, napi_value *args,
@@ -791,11 +820,11 @@ bool njsBaton_getValueFromArg(njsBaton *baton, napi_env env, napi_value *args,
         int argIndex, const char *propertyName, napi_valuetype expectedType,
         napi_value *value, bool *found);
 bool njsBaton_isBindValue(njsBaton *baton, napi_env env, napi_value value);
-bool njsBaton_isDate(njsBaton *baton, napi_env env, napi_value value);
-bool njsBaton_queueWork(njsBaton *baton, napi_env env, const char *methodName,
-        bool (*workCallback)(njsBaton*),
-        bool (*afterWorkCallback)(njsBaton*, napi_env, napi_value*),
-        unsigned int numCallbackArgs);
+bool njsBaton_isDate(njsBaton *baton, napi_env env, napi_value value,
+        bool *isDate);
+napi_value njsBaton_queueWork(njsBaton *baton, napi_env env,
+        const char *methodName, bool (*workCallback)(njsBaton*),
+        bool (*afterWorkCallback)(njsBaton*, napi_env, napi_value*));
 void njsBaton_reportError(njsBaton *baton, napi_env env);
 bool njsBaton_setConstructors(njsBaton *baton, napi_env env);
 bool njsBaton_setError(njsBaton *baton, int errNum, ...);
@@ -861,8 +890,8 @@ bool njsPool_newFromBaton(njsBaton *baton, napi_env env, napi_value *poolObj);
 //-----------------------------------------------------------------------------
 // definition of functions for njsResultSet class
 //-----------------------------------------------------------------------------
-bool njsResultSet_new(njsBaton *baton, napi_env env, dpiStmt *handle,
-        njsVariable *vars, uint32_t numVars, bool autoClose,
+bool njsResultSet_new(njsBaton *baton, napi_env env, njsConnection *conn,
+        dpiStmt *handle, njsVariable *vars, uint32_t numVars,
         napi_value *rsObj);
 
 
@@ -938,6 +967,8 @@ bool njsUtils_genericNew(napi_env env, const njsClassDef *classDef,
         napi_ref constructorRef, napi_value *instanceObj,
         njsBaseInstance **instance);
 bool njsUtils_genericThrowError(napi_env env);
+bool njsUtils_getBoolArg(napi_env env, napi_value *args, int index,
+        bool *result);
 bool njsUtils_getError(napi_env env, dpiErrorInfo *errorInfo,
         const char *buffer, napi_value *error);
 bool njsUtils_getIntArg(napi_env env, napi_value *args, int index,
@@ -989,15 +1020,17 @@ bool njsUtils_validatePropType(napi_env env, napi_value value,
 bool njsVariable_createBuffer(njsVariable *var, njsConnection *conn,
         njsBaton *baton);
 void njsVariable_free(njsVariable *var);
-bool njsVariable_getArrayValue(njsVariable *var, uint32_t pos, njsBaton *baton,
-        napi_env env, napi_value *value);
-uint32_t njsVariable_getDataType(njsVariable *var);
+bool njsVariable_getArrayValue(njsVariable *var, njsConnection *conn,
+        uint32_t pos, njsBaton *baton, napi_env env, napi_value *value);
 bool njsVariable_getMetadataMany(njsVariable *vars, uint32_t numVars,
         napi_env env, bool extended, napi_value *metadata);
 bool njsVariable_getMetadataOne(njsVariable *var, napi_env env, bool extended,
         napi_value *metadata);
-bool njsVariable_getScalarValue(njsVariable *var, njsVariableBuffer *buffer,
-        uint32_t pos, njsBaton *baton, napi_env env, napi_value *value);
+bool njsVariable_getNestedCursorIndices(njsVariable *vars, uint32_t numVars,
+        napi_env env, napi_value *indices);
+bool njsVariable_getScalarValue(njsVariable *var, njsConnection *conn,
+        njsVariableBuffer *buffer, uint32_t pos, njsBaton *baton, napi_env env,
+        napi_value *value);
 bool njsVariable_initForQuery(njsVariable *vars, uint32_t numVars,
         dpiStmt *handle, njsBaton *baton);
 bool njsVariable_initForQueryJS(njsVariable *vars, uint32_t numVars,
